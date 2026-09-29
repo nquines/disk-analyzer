@@ -8,6 +8,7 @@ import subprocess
 import sys
 from typing import Optional
 
+from . import trash
 from .format import bar, human_size
 from .scanner import Entry
 
@@ -62,7 +63,7 @@ class Browser:
         return "/".join(parts).replace("//", "/")
 
 
-def _delete_entry(browser: Browser, entry: Entry) -> Optional[str]:
+def _delete_entry(browser: Browser, entry: Entry, *, permanent: bool = False) -> Optional[str]:
     target = browser.full_path_of(entry)
     # Normalize path building: stack[0].name is already an absolute path.
     if browser.stack[0].name.startswith("/"):
@@ -72,13 +73,11 @@ def _delete_entry(browser: Browser, entry: Entry) -> Optional[str]:
             rel_parts.append(entry.name)
         target = os.path.join(base, *rel_parts) if rel_parts else base
     try:
-        if entry.is_dir:
-            import shutil
-
-            shutil.rmtree(target)
+        if permanent:
+            trash.permanently_delete(target)
         else:
-            os.remove(target)
-    except OSError as exc:
+            trash.move_to_trash(target)
+    except (trash.TrashError, OSError) as exc:
         return str(exc)
     # Remove from in-memory tree and fix up aggregates.
     parent = browser.current
@@ -147,7 +146,7 @@ def _draw(stdscr, browser: Browser) -> None:
             line = f" {size_str} [{b}]{err_marker} {name}"
             stdscr.addstr(y, 0, line[: width - 1].ljust(width - 1), attr)
 
-    footer1 = "↑/k ↓/j move  →/l/Enter open  ←/h/Backspace up  d delete  o reveal  q quit"
+    footer1 = "↑/k ↓/j move  →/l/Enter open  ←/h/Backspace up  d trash  D perm.delete  o reveal  q quit"
     footer2 = browser.message if browser.message else ""
     stdscr.addstr(height - 2, 0, footer1[: width - 1], curses.A_DIM)
     if footer2:
@@ -214,15 +213,34 @@ def _run(stdscr, root: Entry) -> None:
                 entry = children[browser.sel_index]
                 kind = "directory" if entry.is_dir else "file"
                 if _confirm(
-                    stdscr, f"Delete {kind} '{entry.name}' ({human_size(entry.size)})?"
+                    stdscr,
+                    f"Move {kind} '{entry.name}' ({human_size(entry.size)}) to Trash?",
                 ):
-                    err = _delete_entry(browser, entry)
+                    err = _delete_entry(browser, entry, permanent=False)
+                    if err:
+                        browser.message = f"Error moving to Trash: {err}"
+                    else:
+                        new_children = browser.current_children
+                        browser.set_sel_index(min(browser.sel_index, max(0, len(new_children) - 1)))
+                        browser.message = f"Moved to Trash: {entry.name}"
+                else:
+                    browser.message = "Cancelled"
+        elif ch == ord("D"):
+            if children:
+                entry = children[browser.sel_index]
+                kind = "directory" if entry.is_dir else "file"
+                if _confirm(
+                    stdscr,
+                    f"PERMANENTLY delete {kind} '{entry.name}' "
+                    f"({human_size(entry.size)})? This cannot be undone",
+                ):
+                    err = _delete_entry(browser, entry, permanent=True)
                     if err:
                         browser.message = f"Error deleting: {err}"
                     else:
                         new_children = browser.current_children
                         browser.set_sel_index(min(browser.sel_index, max(0, len(new_children) - 1)))
-                        browser.message = f"Deleted {entry.name}"
+                        browser.message = f"Permanently deleted: {entry.name}"
                 else:
                     browser.message = "Cancelled"
 

@@ -6,10 +6,19 @@ runtime dependencies.
 
 ## Features
 
-- **Fast recursive scanning** of any directory (or the whole disk).
+- **Fast recursive scanning** of any directory (or the whole disk), with
+  optional **multi-threaded scanning** (`-j/--jobs N`) that fans the
+  top-level subdirectories out across a thread pool for a real speedup on
+  directories with several large siblings (e.g. your home directory or
+  `/`).
 - **Interactive browser** (`-i`): navigate directories, see proportional size
-  bars, delete files/folders, and reveal items in Finder — all from the
-  terminal.
+  bars, move items to Trash (or permanently delete), and reveal items in
+  Finder — all from the terminal.
+- **Safe deletes by default**: pressing `d` in the browser moves the
+  selected item to Trash (via Finder, so it behaves exactly like a normal
+  drag-to-Trash — correct per-volume Trash, name-collision handling, "Put
+  Back" support). Permanent, unrecoverable deletion is a separate,
+  explicitly-labeled action (`D`, shift-d).
 - **Safe by default**: doesn't cross filesystem/volume boundaries, doesn't
   follow symlinks, and de-dupes hardlinks so totals aren't inflated.
 - **Handles permission errors gracefully** — things like SIP-protected paths
@@ -43,6 +52,9 @@ disk-analyzer ~ -i
 # Scan the whole disk (may need sudo for some system paths)
 sudo disk-analyzer / -i
 
+# Speed up scanning of a directory with many large siblings using 8 threads
+disk-analyzer / -j 8 -i
+
 # Show the 30 largest individual files under Downloads
 disk-analyzer ~/Downloads --largest-files 30
 
@@ -60,7 +72,8 @@ disk-analyzer ~/Projects --csv usage.csv
 | `↑`/`k`, `↓`/`j` | Move selection |
 | `→`/`l`/`Enter` | Open selected directory |
 | `←`/`h`/`Backspace` | Go up one level (or quit at root) |
-| `d` | Delete selected file/directory (asks to confirm) |
+| `d` | Move selected file/directory to Trash (asks to confirm) |
+| `D` | **Permanently** delete selected file/directory — bypasses Trash, cannot be undone (asks to confirm) |
 | `o` | Reveal selected item in Finder |
 | `q` / `Esc` | Quit |
 
@@ -87,8 +100,16 @@ python -m pytest -q
 
 - `disk_analyzer/scanner.py` — recursive scan engine (stdlib `os.scandir`),
   aggregates size/file/dir counts bottom-up, skips other filesystems by
-  default, de-dupes hardlinks, and tolerates `OSError`s per-entry.
+  default, de-dupes hardlinks, and tolerates `OSError`s per-entry. Supports
+  optional multi-threaded scanning (`workers=N`) that fans the top-level
+  subdirectories out across a thread pool — this helps because filesystem
+  syscalls release the GIL, so concurrent directory reads overlap.
 - `disk_analyzer/browser.py` — `curses`-based interactive tree browser.
+- `disk_analyzer/trash.py` — safe deletion helpers: moves items to Trash via
+  Finder (AppleScript/`osascript`) so it behaves like a normal drag-to-Trash
+  (correct per-volume Trash directory, name-collision handling, "Put Back"
+  support), with a manual-move fallback and an explicit permanent-delete
+  path for when that's really wanted.
 - `disk_analyzer/export.py` — JSON/CSV exporters.
 - `disk_analyzer/format.py` — human-readable size/bar formatting helpers.
 - `disk_analyzer/cli.py` — argument parsing and the non-interactive summary

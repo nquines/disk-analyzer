@@ -89,3 +89,34 @@ def test_permission_error_does_not_crash(tmp_path):
         assert "restricted" in names
     finally:
         os.chmod(restricted, 0o755)
+
+
+def test_parallel_scan_matches_serial(tmp_path):
+    _make_tree(tmp_path)
+    serial_root, serial_stats = scan(str(tmp_path), workers=1)
+    parallel_root, parallel_stats = scan(str(tmp_path), workers=4)
+
+    assert parallel_root.size == serial_root.size
+    assert parallel_root.file_count == serial_root.file_count
+    assert parallel_root.dir_count == serial_root.dir_count
+    assert parallel_stats.files_scanned == serial_stats.files_scanned
+    assert parallel_stats.errors == serial_stats.errors
+
+    serial_names = {c.name: c.size for c in serial_root.children}
+    parallel_names = {c.name: c.size for c in parallel_root.children}
+    assert serial_names == parallel_names
+
+
+def test_parallel_scan_many_siblings(tmp_path):
+    # Enough sibling directories to actually exercise the thread pool fan-out.
+    for i in range(12):
+        d = tmp_path / f"dir{i}"
+        d.mkdir()
+        (d / "f.txt").write_bytes(b"y" * (i + 1) * 100)
+
+    serial_root, _ = scan(str(tmp_path), workers=1)
+    parallel_root, _ = scan(str(tmp_path), workers=6)
+
+    assert parallel_root.size == serial_root.size
+    assert parallel_root.file_count == serial_root.file_count == 12
+    assert parallel_root.dir_count == serial_root.dir_count == 12

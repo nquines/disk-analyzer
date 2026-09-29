@@ -15,7 +15,9 @@ from __future__ import annotations
 import fnmatch
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
@@ -97,6 +99,7 @@ class _Scanner:
         root_dev: int,
         progress: Optional[ProgressCallback],
         progress_interval: float,
+        workers: int = 1,
     ) -> None:
         self.use_disk_blocks = use_disk_blocks
         self.cross_mounts = cross_mounts
@@ -107,19 +110,44 @@ class _Scanner:
         self.root_dev = root_dev
         self.progress = progress
         self.progress_interval = progress_interval
+        self.workers = max(1, workers)
         self.stats = ScanStats()
         self.seen_inodes: set[tuple[int, int]] = set()
         self._start = time.monotonic()
         self._last_report = self._start
+        self._lock = threading.Lock()
+
+    def _record_file(self, size: int) -> None:
+        with self._lock:
+            self.stats.files_scanned += 1
+            self.stats.bytes_scanned += size
+
+    def _record_dir(self) -> None:
+        with self._lock:
+            self.stats.dirs_scanned += 1
+
+    def _record_error(self) -> None:
+        with self._lock:
+            self.stats.errors += 1
+
+    def _claim_hardlink(self, key: tuple[int, int]) -> bool:
+        """Returns True if this inode was already seen (caller should skip)."""
+        with self._lock:
+            if key in self.seen_inodes:
+                return True
+            self.seen_inodes.add(key)
+            return False
 
     def _maybe_report(self, current_path: str) -> None:
         if self.progress is None:
             return
         now = time.monotonic()
-        if now - self._last_report >= self.progress_interval:
+        with self._lock:
+            if now - self._last_report < self.progress_interval:
+                return
             self.stats.elapsed = now - self._start
-            self.progress(current_path, self.stats)
             self._last_report = now
+        self.progress(current_path, self.stats)
 
     def scan_dir(self, abs_path: str, rel_path: str, depth: int, keep_children: bool) -> Entry:
         entry = Entry(name=os.path.basename(abs_path) or abs_path, is_dir=True)
@@ -129,7 +157,7 @@ class _Scanner:
                 entries = list(it)
         except OSError as exc:
             entry.error = str(exc)
-            self.stats.errors += 1
+            self._record_error()
             return entry
 
         total_size = 0
@@ -145,7 +173,7 @@ class _Scanner:
             try:
                 st = de.stat(follow_symlinks=self.follow_symlinks)
             except OSError as exc:
-                self.stats.errors += 1
+                self._record_error()
                 if keep_children:
                     children.append(
                         Entry(name=name, is_dir=de.is_dir(follow_symlinks=False), error=str(exc))
@@ -165,7 +193,7 @@ class _Scanner:
                         )
                     continue
                 dir_count += 1
-                self.stats.dirs_scanned += 1
+                self._record_dir()
                 child_keep = keep_children and (self.max_depth is None or depth < self.max_depth)
                 child = self.scan_dir(
                     os.path.join(abs_path, name), child_rel, depth + 1, child_keep
@@ -178,14 +206,12 @@ class _Scanner:
             else:
                 key = (st.st_dev, st.st_ino)
                 if self.dedupe_hardlinks and st.st_nlink > 1:
-                    if key in self.seen_inodes:
+                    if self._claim_hardlink(key):
                         continue
-                    self.seen_inodes.add(key)
                 size = (st.st_blocks * 512) if self.use_disk_blocks else st.st_size
                 total_size += size
                 file_count += 1
-                self.stats.files_scanned += 1
-                self.stats.bytes_scanned += size
+                self._record_file(size)
                 if keep_children:
                     children.append(Entry(name=name, is_dir=False, size=size, file_count=1))
 
@@ -194,6 +220,92 @@ class _Scanner:
         entry.dir_count = dir_count
         if keep_children:
             entry.children = children
+        return entry
+
+    def scan_root(self, root_path: str) -> Entry:
+        """Scan the top-level directory, optionally fanning out immediate
+        subdirectories across a thread pool. Each subdirectory's subtree is
+        then scanned fully serially inside its own worker thread -- this
+        single level of fan-out gives most of the benefit of parallel I/O
+        without any risk of nested-pool deadlocks."""
+        entry = Entry(name=os.path.basename(root_path) or root_path, is_dir=True)
+        self._maybe_report(root_path)
+        try:
+            with os.scandir(root_path) as it:
+                entries = list(it)
+        except OSError as exc:
+            entry.error = str(exc)
+            self._record_error()
+            return entry
+
+        total_size = 0
+        file_count = 0
+        dir_count = 0
+        children: list[Entry] = []
+        dir_tasks: list[tuple[str, str]] = []  # (abs_path, rel_path) per subdirectory
+
+        for de in entries:
+            name = de.name
+            if self.patterns and _matches_any(name, name, self.patterns):
+                continue
+            try:
+                st = de.stat(follow_symlinks=self.follow_symlinks)
+            except OSError as exc:
+                self._record_error()
+                children.append(
+                    Entry(name=name, is_dir=de.is_dir(follow_symlinks=False), error=str(exc))
+                )
+                continue
+
+            is_symlink = de.is_symlink()
+            is_dir = de.is_dir(follow_symlinks=self.follow_symlinks) and (
+                self.follow_symlinks or not is_symlink
+            )
+
+            if is_dir:
+                if not self.cross_mounts and st.st_dev != self.root_dev:
+                    children.append(
+                        Entry(name=name, is_dir=True, error="different filesystem (skipped)")
+                    )
+                    continue
+                self._record_dir()
+                dir_tasks.append((os.path.join(root_path, name), name))
+            else:
+                key = (st.st_dev, st.st_ino)
+                if self.dedupe_hardlinks and st.st_nlink > 1:
+                    if self._claim_hardlink(key):
+                        continue
+                size = (st.st_blocks * 512) if self.use_disk_blocks else st.st_size
+                total_size += size
+                file_count += 1
+                self._record_file(size)
+                children.append(Entry(name=name, is_dir=False, size=size, file_count=1))
+
+        child_keep = self.max_depth is None or 0 < self.max_depth
+        results: dict[str, Entry] = {}
+        if self.workers > 1 and len(dir_tasks) > 1:
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                futures = {
+                    pool.submit(self.scan_dir, abs_path, rel, 1, child_keep): rel
+                    for abs_path, rel in dir_tasks
+                }
+                for fut in as_completed(futures):
+                    results[futures[fut]] = fut.result()
+        else:
+            for abs_path, rel in dir_tasks:
+                results[rel] = self.scan_dir(abs_path, rel, 1, child_keep)
+
+        for _, rel in dir_tasks:
+            child = results[rel]
+            total_size += child.size
+            file_count += child.file_count
+            dir_count += 1 + child.dir_count
+            children.append(child)
+
+        entry.size = total_size
+        entry.file_count = file_count
+        entry.dir_count = dir_count
+        entry.children = children
         return entry
 
 
@@ -209,6 +321,7 @@ def scan(
     max_depth: Optional[int] = None,
     progress: Optional[ProgressCallback] = None,
     progress_interval: float = 0.15,
+    workers: int = 1,
 ) -> tuple[Entry, ScanStats]:
     """Scan ``root`` and return ``(tree, stats)``.
 
@@ -216,6 +329,13 @@ def scan(
     in the resulting tree; sizes/counts are still aggregated correctly for
     everything below that depth, this just bounds memory usage on very
     deep/wide trees while keeping totals correct.
+
+    ``workers`` > 1 fans the immediate top-level subdirectories out across a
+    thread pool (each subtree is still scanned serially within its own
+    thread). This mostly helps because filesystem syscalls release the GIL,
+    so concurrent directory reads can overlap. Best gains come from
+    scanning a directory with several large sibling subdirectories (e.g. a
+    home directory or "/").
     """
     root = os.path.abspath(os.path.expanduser(root))
     patterns = list(exclude or [])
@@ -238,8 +358,9 @@ def scan(
         root_dev=root_stat.st_dev,
         progress=progress,
         progress_interval=progress_interval,
+        workers=workers,
     )
-    entry = scanner.scan_dir(root, "", 0, keep_children=True)
+    entry = scanner.scan_root(root)
     entry.name = root
     scanner.stats.elapsed = time.monotonic() - scanner._start
     if progress is not None:

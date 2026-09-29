@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from typing import Optional
@@ -11,6 +12,7 @@ from .format import bar, human_size
 from .scanner import Entry, ScanStats, iter_largest_files, scan
 
 DEFAULT_TOP_N = 20
+DEFAULT_WORKERS = min(8, (os.cpu_count() or 4) * 2)
 
 
 def _default_targets() -> list[str]:
@@ -50,6 +52,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--interactive",
         action="store_true",
         help="Launch the interactive ncdu-style terminal browser",
+    )
+    p.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Scan top-level subdirectories concurrently using N threads "
+        "(speeds up scans with several large sibling directories, e.g. "
+        "your home directory or '/'). Default: 1 (serial). Try %(default_workers)s "
+        "on this machine for a good starting point." % {"default_workers": DEFAULT_WORKERS},
     )
     p.add_argument(
         "-x",
@@ -193,6 +206,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             exclude_common=args.exclude_common,
             max_depth=args.max_depth,
             progress=progress,
+            workers=args.jobs,
         )
     finally:
         if progress is not None:
