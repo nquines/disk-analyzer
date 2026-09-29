@@ -19,6 +19,10 @@ class Browser:
         self.stack: list[Entry] = [root]
         self.selected: list[int] = [0]
         self.message: str = ""
+        # Names marked for batch deletion within the *current* directory
+        # listing. Scoped to the current directory (cleared on navigation)
+        # to keep the mental model simple: what you see is what's marked.
+        self.marked: set[str] = set()
 
     @property
     def current(self) -> Entry:
@@ -35,6 +39,24 @@ class Browser:
     def set_sel_index(self, value: int) -> None:
         self.selected[-1] = value
 
+    def toggle_mark(self, name: str) -> None:
+        if name in self.marked:
+            self.marked.discard(name)
+        else:
+            self.marked.add(name)
+
+    def toggle_mark_all(self) -> None:
+        names = {c.name for c in self.current_children}
+        if names and names <= self.marked:
+            self.marked -= names
+        else:
+            self.marked |= names
+
+    def marked_entries(self) -> list[Entry]:
+        if not self.marked:
+            return []
+        return [c for c in self.current_children if c.name in self.marked]
+
     def enter(self) -> None:
         children = self.current_children
         if not children:
@@ -45,11 +67,13 @@ class Browser:
             if child.is_dir and not child.error:
                 self.stack.append(child)
                 self.selected.append(0)
+                self.marked = set()
 
     def back(self) -> bool:
         if len(self.stack) > 1:
             self.stack.pop()
             self.selected.pop()
+            self.marked = set()
             return True
         return False
 
@@ -79,18 +103,31 @@ def _delete_entry(browser: Browser, entry: Entry, *, permanent: bool = False) ->
             trash.move_to_trash(target)
     except (trash.TrashError, OSError) as exc:
         return str(exc)
-    # Remove from in-memory tree and fix up aggregates.
+    # Remove from in-memory tree and fix up aggregates for every ancestor
+    # in the stack (from the current directory up to the root), since the
+    # deleted entry was counted in all of their totals.
     parent = browser.current
     parent.children = [c for c in parent.children if c is not entry]
-    for anc in reversed(browser.stack):
+    for anc in browser.stack:
         anc.size -= entry.size
         if entry.is_dir:
             anc.dir_count -= 1 + entry.dir_count
         else:
             anc.file_count -= 1
-        if anc is parent:
-            break
     return None
+
+
+def _delete_entries(
+    browser: Browser, entries: list[Entry], *, permanent: bool = False
+) -> list[tuple[str, str]]:
+    """Delete multiple entries, continuing past individual failures.
+    Returns a list of ``(name, error)`` for any that failed."""
+    failures: list[tuple[str, str]] = []
+    for entry in entries:
+        err = _delete_entry(browser, entry, permanent=permanent)
+        if err:
+            failures.append((entry.name, err))
+    return failures
 
 
 def _reveal_in_finder(path: str) -> None:
@@ -122,6 +159,10 @@ def _draw(stdscr, browser: Browser) -> None:
         f" {human_size(current.size)} total, "
         f"{current.file_count} files, {current.dir_count} dirs "
     )
+    if browser.marked:
+        marked_entries = browser.marked_entries()
+        marked_size = sum(e.size for e in marked_entries)
+        summary += f" | {len(marked_entries)} marked ({human_size(marked_size)}) "
     stdscr.addstr(1, 0, summary[: width - 1], curses.A_DIM)
     stdscr.addstr(2, 0, "-" * (width - 1))
 
@@ -136,17 +177,24 @@ def _draw(stdscr, browser: Browser) -> None:
             child = children[idx]
             y = header_lines + row
             is_sel = idx == sel
+            is_marked = child.name in browser.marked
             attr = curses.A_REVERSE if is_sel else curses.A_NORMAL
+            if is_marked:
+                attr |= curses.color_pair(2) | curses.A_BOLD
             frac = child.size / max_size if max_size else 0
             size_str = human_size(child.size).rjust(9)
             b = bar(frac, width=16)
             marker = "/" if child.is_dir else " "
             err_marker = " !" if child.error else "  "
+            checkbox = "[x]" if is_marked else "[ ]"
             name = child.name + marker
-            line = f" {size_str} [{b}]{err_marker} {name}"
+            line = f" {checkbox} {size_str} [{b}]{err_marker} {name}"
             stdscr.addstr(y, 0, line[: width - 1].ljust(width - 1), attr)
 
-    footer1 = "↑/k ↓/j move  →/l/Enter open  ←/h/Backspace up  d trash  D perm.delete  o reveal  q quit"
+    footer1 = (
+        "↑/k ↓/j move  →/l/Enter open  ←/h/Backspace up  space mark  a mark-all"
+        "  d trash  D perm.delete  o reveal  q quit"
+    )
     footer2 = browser.message if browser.message else ""
     stdscr.addstr(height - 2, 0, footer1[: width - 1], curses.A_DIM)
     if footer2:
@@ -197,6 +245,16 @@ def _run(stdscr, root: Entry) -> None:
             if not browser.back():
                 break
             browser.message = ""
+        elif ch == ord(" "):
+            if children:
+                entry = children[browser.sel_index]
+                browser.toggle_mark(entry.name)
+                browser.set_sel_index(min(len(children) - 1, browser.sel_index + 1))
+                browser.message = ""
+        elif ch == ord("a"):
+            if children:
+                browser.toggle_mark_all()
+                browser.message = ""
         elif ch == ord("o"):
             if children:
                 entry = children[browser.sel_index]
@@ -208,39 +266,54 @@ def _run(stdscr, root: Entry) -> None:
                 target = os.path.join(base, *rel_parts) if rel_parts else base
                 _reveal_in_finder(target)
                 browser.message = f"Revealed in Finder: {target}"
-        elif ch == ord("d"):
-            if children:
-                entry = children[browser.sel_index]
-                kind = "directory" if entry.is_dir else "file"
-                if _confirm(
-                    stdscr,
-                    f"Move {kind} '{entry.name}' ({human_size(entry.size)}) to Trash?",
-                ):
-                    err = _delete_entry(browser, entry, permanent=False)
-                    if err:
-                        browser.message = f"Error moving to Trash: {err}"
+        elif ch in (ord("d"), ord("D")):
+            permanent = ch == ord("D")
+            marked = browser.marked_entries()
+            if marked:
+                total_size = sum(e.size for e in marked)
+                if permanent:
+                    prompt = (
+                        f"PERMANENTLY delete {len(marked)} marked items "
+                        f"({human_size(total_size)})? This cannot be undone"
+                    )
+                else:
+                    prompt = (
+                        f"Move {len(marked)} marked items "
+                        f"({human_size(total_size)}) to Trash?"
+                    )
+                if _confirm(stdscr, prompt):
+                    failures = _delete_entries(browser, marked, permanent=permanent)
+                    browser.marked = set()
+                    new_children = browser.current_children
+                    browser.set_sel_index(min(browser.sel_index, max(0, len(new_children) - 1)))
+                    if failures:
+                        names = ", ".join(name for name, _ in failures)
+                        browser.message = f"{len(failures)} failed: {names}"
                     else:
-                        new_children = browser.current_children
-                        browser.set_sel_index(min(browser.sel_index, max(0, len(new_children) - 1)))
-                        browser.message = f"Moved to Trash: {entry.name}"
+                        verb = "Permanently deleted" if permanent else "Moved to Trash"
+                        browser.message = f"{verb}: {len(marked)} items"
                 else:
                     browser.message = "Cancelled"
-        elif ch == ord("D"):
-            if children:
+            elif children:
                 entry = children[browser.sel_index]
                 kind = "directory" if entry.is_dir else "file"
-                if _confirm(
-                    stdscr,
-                    f"PERMANENTLY delete {kind} '{entry.name}' "
-                    f"({human_size(entry.size)})? This cannot be undone",
-                ):
-                    err = _delete_entry(browser, entry, permanent=True)
+                if permanent:
+                    prompt = (
+                        f"PERMANENTLY delete {kind} '{entry.name}' "
+                        f"({human_size(entry.size)})? This cannot be undone"
+                    )
+                else:
+                    prompt = f"Move {kind} '{entry.name}' ({human_size(entry.size)}) to Trash?"
+                if _confirm(stdscr, prompt):
+                    err = _delete_entry(browser, entry, permanent=permanent)
                     if err:
-                        browser.message = f"Error deleting: {err}"
+                        verb = "deleting" if permanent else "moving to Trash"
+                        browser.message = f"Error {verb}: {err}"
                     else:
                         new_children = browser.current_children
                         browser.set_sel_index(min(browser.sel_index, max(0, len(new_children) - 1)))
-                        browser.message = f"Permanently deleted: {entry.name}"
+                        verb = "Permanently deleted" if permanent else "Moved to Trash"
+                        browser.message = f"{verb}: {entry.name}"
                 else:
                     browser.message = "Cancelled"
 

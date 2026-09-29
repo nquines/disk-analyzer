@@ -12,7 +12,8 @@ runtime dependencies.
   directories with several large siblings (e.g. your home directory or
   `/`).
 - **Interactive browser** (`-i`): navigate directories, see proportional size
-  bars, move items to Trash (or permanently delete), and reveal items in
+  bars, mark multiple files/folders and delete them together (or just one at
+  a time), move items to Trash (or permanently delete), and reveal items in
   Finder — all from the terminal.
 - **Safe deletes by default**: pressing `d` in the browser moves the
   selected item to Trash (via Finder, so it behaves exactly like a normal
@@ -70,12 +71,23 @@ disk-analyzer ~/Projects --csv usage.csv
 | Key | Action |
 | --- | --- |
 | `↑`/`k`, `↓`/`j` | Move selection |
-| `→`/`l`/`Enter` | Open selected directory |
+| `→`/`l`/`Enter` | Open selected directory (drill in without deleting anything) |
 | `←`/`h`/`Backspace` | Go up one level (or quit at root) |
-| `d` | Move selected file/directory to Trash (asks to confirm) |
-| `D` | **Permanently** delete selected file/directory — bypasses Trash, cannot be undone (asks to confirm) |
+| `Space` | Mark/unmark the selected item (auto-advances to the next row) |
+| `a` | Mark/unmark **all** items in the current listing |
+| `d` | Move marked items to Trash — or just the selected item if nothing's marked (asks to confirm) |
+| `D` | **Permanently** delete marked items — or just the selected item if nothing's marked — bypasses Trash, cannot be undone (asks to confirm) |
 | `o` | Reveal selected item in Finder |
 | `q` / `Esc` | Quit |
+
+Marks are scoped to the current directory listing — they're cleared when
+you open a different folder or go back up, so you always know exactly
+what's about to be deleted.
+
+**Typical workflow**: open a large folder (e.g. `Downloads`) with `→`,
+look through what's inside, press `Space` on each item you don't want,
+then `d` once to move everything you marked to Trash in one go — the
+parent folder and everything you didn't mark are left untouched.
 
 ### CLI options
 
